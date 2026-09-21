@@ -141,6 +141,25 @@
   .stats .stat .n{font-size:22px;font-weight:800;color:var(--primary-d)}
   .stats .stat .l{font-size:11px;color:var(--muted);font-weight:600;margin-top:2px}
   .hint{color:var(--muted);font-size:13px;line-height:1.5;margin:6px 0 14px}
+
+  /* Toggle détourage + spinner photo */
+  .toggle-row{display:flex;align-items:center;gap:10px;margin:2px 0 12px;
+    background:var(--chip);padding:11px 12px;border-radius:12px}
+  .toggle-row label{font-size:14px;font-weight:600;flex:1;margin:0;color:var(--text)}
+  .switch{position:relative;width:44px;height:26px;flex:0 0 auto}
+  .switch input{opacity:0;width:0;height:0}
+  .switch .sl{position:absolute;inset:0;background:#cfc9e6;border-radius:999px;transition:.2s;cursor:pointer}
+  .switch .sl:before{content:"";position:absolute;width:20px;height:20px;left:3px;top:3px;
+    background:#fff;border-radius:50%;transition:.2s}
+  .switch input:checked+.sl{background:var(--primary)}
+  .switch input:checked+.sl:before{transform:translateX(18px)}
+  .photobox.busy{position:relative}
+  .photobox .spinner{position:absolute;inset:0;background:rgba(255,255,255,.85);
+    display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;
+    color:var(--primary-d);font-size:13px;font-weight:600;text-align:center;padding:16px}
+  .spin{width:34px;height:34px;border:4px solid var(--chip);border-top-color:var(--primary);
+    border-radius:50%;animation:rot 1s linear infinite}
+  @keyframes rot{to{transform:rotate(360deg)}}
 </style>
 </head>
 <body>
@@ -224,6 +243,10 @@
       </div>
       <input type="file" id="photo-input" accept="image/*" capture="environment" hidden>
     </div>
+    <div class="toggle-row">
+      <label for="cutout-toggle">✨ Détourer le fond (look catalogue)</label>
+      <span class="switch"><input type="checkbox" id="cutout-toggle" checked><span class="sl"></span></span>
+    </div>
     <div class="field">
       <label>Nom</label>
       <input type="text" id="item-name" placeholder="ex: Chemise blanche">
@@ -258,7 +281,24 @@
 
 <div class="toast" id="toast"></div>
 
-<script>
+<script type="module">
+/* ============ Détourage IA (lazy-load) ============ */
+/* La bibliothèque n'est téléchargée qu'au premier détourage. */
+let _removeBg=null, _bgLibFailed=false;
+async function getRemoveBg(){
+  if(_removeBg) return _removeBg;
+  if(_bgLibFailed) return null;
+  try{
+    const mod=await import('https://esm.sh/@imgly/background-removal@1.5.5');
+    _removeBg=mod.removeBackground||mod.default?.removeBackground||mod.default;
+    return _removeBg;
+  }catch(err){
+    console.warn('Lib détourage indisponible',err);
+    _bgLibFailed=true;
+    return null;
+  }
+}
+
 /* ============ Stockage local (IndexedDB) ============ */
 const DB_NAME='dressing-db', DB_VER=1;
 let db;
@@ -299,31 +339,116 @@ function fmtDate(s){const d=new Date(s+'T00:00');return d.toLocaleDateString('fr
 function toast(msg){const t=$('toast');t.textContent=msg;t.classList.add('show');clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove('show'),1800);}
 function allTags(){const s=new Set();items.forEach(i=>i.tags.forEach(t=>s.add(t)));return [...s].sort();}
 
-/* Place la photo, sans déformation, centrée sur un fond gris carré uniforme */
-const PHOTO_BG='#ececf0';      // gris neutre doux
+/* ============ Traitement photo (look catalogue) ============ */
+const PHOTO_BG='#ffffff';      // fond blanc catalogue
+const PHOTO_BG_FALLBACK='#ececf0'; // gris doux si pas de détourage
 const PHOTO_SIZE=900;          // image finale carrée
-function resizeImage(file){
-  return new Promise(res=>{
-    const img=new Image();const url=URL.createObjectURL(file);
-    img.onload=()=>{
-      const S=PHOTO_SIZE;
-      const c=document.createElement('canvas');c.width=S;c.height=S;
-      const ctx=c.getContext('2d');
-      ctx.imageSmoothingQuality='high';
-      // fond uniforme
-      ctx.fillStyle=PHOTO_BG;ctx.fillRect(0,0,S,S);
-      // dimensions "contain" : toute la photo tient dans le carré, centrée
-      const pad=Math.round(S*0.04); // petite marge autour
-      const box=S-pad*2;
-      const scale=Math.min(box/img.width,box/img.height);
-      const w=Math.round(img.width*scale), h=Math.round(img.height*scale);
-      const x=Math.round((S-w)/2), y=Math.round((S-h)/2);
-      ctx.drawImage(img,x,y,w,h);
-      URL.revokeObjectURL(url);
-      res(c.toDataURL('image/jpeg',0.85));
-    };
-    img.src=url;
+/* Réglages d'embellissement (ajustables) */
+const CONTRAST=1.10;           // >1 = plus de contraste
+const SATURATION=1.14;         // >1 = couleurs plus vives
+const AUTO_LEVELS_CLIP=0.01;   // 1% de pixels ignorés aux extrêmes
+
+/* Charge un fichier/blob en objet Image */
+function loadImage(src){
+  return new Promise((res,rej)=>{
+    const img=new Image();
+    img.onload=()=>res(img);
+    img.onerror=rej;
+    img.src=src;
   });
+}
+
+/* Compose l'image (déjà chargée) sur un carré, fond uni, centrée sans déformation */
+function composeSquare(img,bg){
+  const S=PHOTO_SIZE;
+  const c=document.createElement('canvas');c.width=S;c.height=S;
+  const ctx=c.getContext('2d');
+  ctx.imageSmoothingQuality='high';
+  ctx.fillStyle=bg;ctx.fillRect(0,0,S,S);
+  const pad=Math.round(S*0.05);
+  const box=S-pad*2;
+  const scale=Math.min(box/img.width,box/img.height);
+  const w=Math.round(img.width*scale), h=Math.round(img.height*scale);
+  const x=Math.round((S-w)/2), y=Math.round((S-h)/2);
+  ctx.drawImage(img,x,y,w,h);
+  return {canvas:c,ctx,rect:{x,y,w,h}};
+}
+
+/* Embellit les couleurs : auto-niveaux + contraste + saturation, calculé sur la zone du vêtement */
+function enhance(ctx,rect){
+  const S=PHOTO_SIZE;
+  const img=ctx.getImageData(0,0,S,S);
+  const d=img.data;
+  // 1) auto-niveaux : histogramme de luminance sur la zone du vêtement
+  const hist=new Array(256).fill(0);
+  let total=0;
+  const x0=rect.x,y0=rect.y,x1=rect.x+rect.w,y1=rect.y+rect.h;
+  for(let y=y0;y<y1;y++){
+    for(let x=x0;x<x1;x++){
+      const i=(y*S+x)*4;
+      if(d[i+3]<8) continue; // ignore les pixels transparents
+      const lum=(d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114)|0;
+      hist[lum]++;total++;
+    }
+  }
+  let lo=0,hi=255;
+  if(total>0){
+    const clip=total*AUTO_LEVELS_CLIP;
+    let acc=0;for(let i=0;i<256;i++){acc+=hist[i];if(acc>=clip){lo=i;break;}}
+    acc=0;for(let i=255;i>=0;i--){acc+=hist[i];if(acc>=clip){hi=i;break;}}
+  }
+  const range=Math.max(1,hi-lo);
+  // 2) applique niveaux + contraste + saturation à toute l'image
+  for(let i=0;i<d.length;i+=4){
+    if(d[i+3]<8) continue;
+    let r=d[i],g=d[i+1],b=d[i+2];
+    // niveaux
+    r=(r-lo)*255/range; g=(g-lo)*255/range; b=(b-lo)*255/range;
+    // contraste (autour de 128)
+    r=(r-128)*CONTRAST+128; g=(g-128)*CONTRAST+128; b=(b-128)*CONTRAST+128;
+    // saturation
+    const gray=r*0.299+g*0.587+b*0.114;
+    r=gray+(r-gray)*SATURATION; g=gray+(g-gray)*SATURATION; b=gray+(b-gray)*SATURATION;
+    d[i]=r<0?0:r>255?255:r;
+    d[i+1]=g<0?0:g>255?255:g;
+    d[i+2]=b<0?0:b>255?255:b;
+  }
+  ctx.putImageData(img,0,0);
+}
+
+/* Pipeline complet : (détourage IA optionnel) -> fond uni -> embellissement -> JPEG */
+async function processPhoto(file,{cutout=true,onStatus}={}){
+  let sourceImg, bg=PHOTO_BG;
+  if(cutout){
+    const removeBg=await getRemoveBg();
+    if(removeBg){
+      try{
+        onStatus&&onStatus('Détourage en cours…');
+        const outBlob=await removeBg(file);
+        const url=URL.createObjectURL(outBlob);
+        sourceImg=await loadImage(url);
+        URL.revokeObjectURL(url);
+        bg=PHOTO_BG; // fond blanc derrière le vêtement détouré
+      }catch(err){
+        console.warn('Détourage échoué, repli sur photo brute',err);
+        toast('Détourage impossible, photo gardée telle quelle');
+      }
+    }else{
+      toast('Détourage indisponible (hors-ligne ?)');
+    }
+  }
+  if(!sourceImg){
+    // Pas de vêtement détouré (détourage désactivé ou échec) :
+    // on garde la photo entière sur fond gris doux pour rester cohérent.
+    const url=URL.createObjectURL(file);
+    sourceImg=await loadImage(url);
+    URL.revokeObjectURL(url);
+    bg=PHOTO_BG_FALLBACK;
+  }
+  onStatus&&onStatus('Finalisation…');
+  const {canvas,ctx,rect}=composeSquare(sourceImg,bg);
+  enhance(ctx,rect);
+  return canvas.toDataURL('image/jpeg',0.9);
 }
 
 /* ============ Navigation ============ */
@@ -405,12 +530,30 @@ function renderPhotoBox(){
   const box=$('photobox');
   box.innerHTML=currentPhoto?`<img src="${currentPhoto}">`:`<span class="ph">📷</span><span>Prendre une photo / choisir</span>`;
 }
-$('photobox').onclick=()=>$('photo-input').click();
+function showPhotoSpinner(msg){
+  const box=$('photobox');box.classList.add('busy');
+  let sp=box.querySelector('.spinner');
+  if(!sp){sp=document.createElement('div');sp.className='spinner';box.appendChild(sp);}
+  sp.innerHTML=`<div class="spin"></div><span>${msg||'Traitement…'}</span>`;
+}
+function hidePhotoSpinner(){
+  const box=$('photobox');box.classList.remove('busy');
+  const sp=box.querySelector('.spinner');if(sp)sp.remove();
+}
+let photoProcessing=false;
+$('photobox').onclick=()=>{if(!photoProcessing)$('photo-input').click();};
 $('photo-input').onchange=async e=>{
-  const f=e.target.files[0];if(!f)return;
-  currentPhoto=await resizeImage(f);
-  renderPhotoBox();
-  e.target.value='';
+  const f=e.target.files[0];e.target.value='';if(!f)return;
+  const cutout=$('cutout-toggle').checked;
+  photoProcessing=true;
+  showPhotoSpinner(cutout?'Préparation du détourage…':'Traitement…');
+  try{
+    currentPhoto=await processPhoto(f,{cutout,onStatus:showPhotoSpinner});
+  }catch(err){
+    console.error(err);toast('Erreur de traitement de la photo');
+  }finally{
+    photoProcessing=false;hidePhotoSpinner();renderPhotoBox();
+  }
 };
 function renderTagList(){
   $('tag-list').innerHTML=currentTags.map((t,i)=>
@@ -432,6 +575,7 @@ $('add-tag').onclick=addTagFromInput;
 $('tag-input').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();addTagFromInput();}});
 $('cancel-item').onclick=()=>$('modal-item').classList.remove('open');
 $('save-item').onclick=async()=>{
+  if(photoProcessing){toast('Patiente, photo en cours…');return;}
   if(!currentPhoto){toast('Ajoute une photo 📷');return;}
   const name=$('item-name').value.trim();
   if(editingId){
