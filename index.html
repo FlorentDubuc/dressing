@@ -340,13 +340,17 @@ function toast(msg){const t=$('toast');t.textContent=msg;t.classList.add('show')
 function allTags(){const s=new Set();items.forEach(i=>i.tags.forEach(t=>s.add(t)));return [...s].sort();}
 
 /* ============ Traitement photo (look catalogue) ============ */
-const PHOTO_BG='#ffffff';      // fond blanc catalogue
+const PHOTO_BG='#f6f4f0';      // fond blanc chaud (style H&M)
 const PHOTO_BG_FALLBACK='#ececf0'; // gris doux si pas de détourage
 const PHOTO_SIZE=900;          // image finale carrée
 /* Réglages d'embellissement (ajustables) */
 const CONTRAST=1.10;           // >1 = plus de contraste
-const SATURATION=1.14;         // >1 = couleurs plus vives
+const SATURATION=1.05;         // >1 = couleurs plus vives (naturel style H&M)
 const AUTO_LEVELS_CLIP=0.01;   // 1% de pixels ignorés aux extrêmes
+/* Ombre portée (effet flottant, appliquée uniquement au vêtement détouré) */
+const SHADOW_BLUR=15;          // flou de l'ombre en pixels
+const SHADOW_OPACITY=0.20;     // opacité de l'ombre (0-1)
+const SHADOW_OFFSET_Y=10;      // décalage vertical de l'ombre en pixels
 
 /* Charge un fichier/blob en objet Image */
 function loadImage(src){
@@ -358,8 +362,9 @@ function loadImage(src){
   });
 }
 
-/* Compose l'image (déjà chargée) sur un carré, fond uni, centrée sans déformation */
-function composeSquare(img,bg){
+/* Compose l'image (déjà chargée) sur un carré, fond uni, centrée sans déformation.
+   Si withShadow=true, dessine une ombre portée douce sous l'image (effet flottant). */
+function composeSquare(img,bg,withShadow=false){
   const S=PHOTO_SIZE;
   const c=document.createElement('canvas');c.width=S;c.height=S;
   const ctx=c.getContext('2d');
@@ -370,6 +375,25 @@ function composeSquare(img,bg){
   const scale=Math.min(box/img.width,box/img.height);
   const w=Math.round(img.width*scale), h=Math.round(img.height*scale);
   const x=Math.round((S-w)/2), y=Math.round((S-h)/2);
+
+  if(withShadow){
+    // 1) Dessine la silhouette du vêtement dans un canvas temporaire
+    const sc=document.createElement('canvas');sc.width=S;sc.height=S;
+    const sctx=sc.getContext('2d');
+    sctx.imageSmoothingQuality='high';
+    sctx.drawImage(img,x,y+SHADOW_OFFSET_Y,w,h);
+    // 2) Transforme la silhouette en noir (garde l'alpha)
+    sctx.globalCompositeOperation='source-in';
+    sctx.fillStyle='#000';sctx.fillRect(0,0,S,S);
+    // 3) Copie sur le canvas principal en floutant, avec opacité réduite
+    ctx.save();
+    ctx.filter=`blur(${SHADOW_BLUR}px)`;
+    ctx.globalAlpha=SHADOW_OPACITY;
+    ctx.drawImage(sc,0,0);
+    ctx.restore();
+  }
+
+  // Dessine le vêtement par-dessus (ombre incluse ou non)
   ctx.drawImage(img,x,y,w,h);
   return {canvas:c,ctx,rect:{x,y,w,h}};
 }
@@ -418,7 +442,7 @@ function enhance(ctx,rect){
 
 /* Pipeline complet : (détourage IA optionnel) -> fond uni -> embellissement -> JPEG */
 async function processPhoto(file,{cutout=true,onStatus}={}){
-  let sourceImg, bg=PHOTO_BG;
+  let sourceImg, bg=PHOTO_BG, cutoutOk=false;
   if(cutout){
     const removeBg=await getRemoveBg();
     if(removeBg){
@@ -428,7 +452,8 @@ async function processPhoto(file,{cutout=true,onStatus}={}){
         const url=URL.createObjectURL(outBlob);
         sourceImg=await loadImage(url);
         URL.revokeObjectURL(url);
-        bg=PHOTO_BG; // fond blanc derrière le vêtement détouré
+        bg=PHOTO_BG; // fond clair derrière le vêtement détouré
+        cutoutOk=true;
       }catch(err){
         console.warn('Détourage échoué, repli sur photo brute',err);
         toast('Détourage impossible, photo gardée telle quelle');
@@ -446,7 +471,8 @@ async function processPhoto(file,{cutout=true,onStatus}={}){
     bg=PHOTO_BG_FALLBACK;
   }
   onStatus&&onStatus('Finalisation…');
-  const {canvas,ctx,rect}=composeSquare(sourceImg,bg);
+  // L'ombre portée (effet flottant) n'est appliquée qu'au vêtement détouré
+  const {canvas,ctx,rect}=composeSquare(sourceImg,bg,cutoutOk);
   enhance(ctx,rect);
   return canvas.toDataURL('image/jpeg',0.9);
 }
