@@ -132,6 +132,15 @@
   .selbar button{background:#fff;color:var(--primary);border:none;padding:8px 14px;
     border-radius:10px;font-weight:700;cursor:pointer}
   .count-badge{font-size:13px;color:var(--muted);margin-left:6px}
+
+  /* Réglages */
+  .settings-card{background:var(--card);border-radius:18px;padding:18px;
+    box-shadow:0 2px 10px rgba(90,70,180,.06);margin-bottom:20px}
+  .stats{display:flex;gap:10px;margin-bottom:14px}
+  .stats .stat{flex:1;background:var(--chip);border-radius:14px;padding:12px 8px;text-align:center}
+  .stats .stat .n{font-size:22px;font-weight:800;color:var(--primary-d)}
+  .stats .stat .l{font-size:11px;color:var(--muted);font-weight:600;margin-top:2px}
+  .hint{color:var(--muted);font-size:13px;line-height:1.5;margin:6px 0 14px}
 </style>
 </head>
 <body>
@@ -172,6 +181,19 @@
     <div class="section-title">Mes valises enregistrées</div>
     <div id="suitcase-saved"></div>
   </section>
+
+  <!-- VIEW: Réglages -->
+  <section class="view" id="view-settings">
+    <div class="section-title">Sauvegarde</div>
+    <div class="settings-card">
+      <div class="stats" id="settings-stats"></div>
+      <p class="hint">Exporte régulièrement tes données dans un fichier que tu peux ranger sur ton Mac. Si tu vides les données du navigateur, tu pourras tout restaurer depuis ce fichier.</p>
+      <button class="btn" id="export-btn">⬇︎ Exporter mes données</button>
+      <button class="btn sec" id="import-btn">⬆︎ Importer une sauvegarde</button>
+      <input type="file" id="import-input" accept="application/json,.json" hidden>
+      <p class="hint" style="margin-top:14px">L'import <b>remplace</b> toutes les données actuelles par celles du fichier.</p>
+    </div>
+  </section>
 </main>
 
 <button class="fab" id="fab">+</button>
@@ -188,6 +210,7 @@
   <button class="active" data-view="closet"><span class="ic">👕</span>Dressing</button>
   <button data-view="outfit"><span class="ic">📅</span>Aujourd'hui</button>
   <button data-view="suitcase"><span class="ic">🧳</span>Valise</button>
+  <button data-view="settings"><span class="ic">⚙️</span>Réglages</button>
 </nav>
 
 <!-- Modal: Add / Edit item -->
@@ -257,6 +280,7 @@ function put(store,val){return new Promise((res,rej)=>{const r=tx(store,'readwri
 function del(store,key){return new Promise((res,rej)=>{const r=tx(store,'readwrite').delete(key);r.onsuccess=()=>res();r.onerror=rej;});}
 function getAll(store){return new Promise((res,rej)=>{const r=tx(store,'readonly').getAll();r.onsuccess=()=>res(r.result);r.onerror=rej;});}
 function get(store,key){return new Promise((res,rej)=>{const r=tx(store,'readonly').get(key);r.onsuccess=()=>res(r.result);r.onerror=rej;});}
+function clearStore(store){return new Promise((res,rej)=>{const r=tx(store,'readwrite').clear();r.onsuccess=()=>res();r.onerror=rej;});}
 
 /* ============ État ============ */
 let items=[];            // vêtements
@@ -275,17 +299,28 @@ function fmtDate(s){const d=new Date(s+'T00:00');return d.toLocaleDateString('fr
 function toast(msg){const t=$('toast');t.textContent=msg;t.classList.add('show');clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove('show'),1800);}
 function allTags(){const s=new Set();items.forEach(i=>i.tags.forEach(t=>s.add(t)));return [...s].sort();}
 
-/* Redimensionne l'image pour économiser le stockage */
-function resizeImage(file,max=900){
+/* Place la photo, sans déformation, centrée sur un fond gris carré uniforme */
+const PHOTO_BG='#ececf0';      // gris neutre doux
+const PHOTO_SIZE=900;          // image finale carrée
+function resizeImage(file){
   return new Promise(res=>{
     const img=new Image();const url=URL.createObjectURL(file);
     img.onload=()=>{
-      let{width:w,height:h}=img;
-      if(w>h&&w>max){h=h*max/w;w=max;} else if(h>max){w=w*max/h;h=max;}
-      const c=document.createElement('canvas');c.width=w;c.height=h;
-      c.getContext('2d').drawImage(img,0,0,w,h);
+      const S=PHOTO_SIZE;
+      const c=document.createElement('canvas');c.width=S;c.height=S;
+      const ctx=c.getContext('2d');
+      ctx.imageSmoothingQuality='high';
+      // fond uniforme
+      ctx.fillStyle=PHOTO_BG;ctx.fillRect(0,0,S,S);
+      // dimensions "contain" : toute la photo tient dans le carré, centrée
+      const pad=Math.round(S*0.04); // petite marge autour
+      const box=S-pad*2;
+      const scale=Math.min(box/img.width,box/img.height);
+      const w=Math.round(img.width*scale), h=Math.round(img.height*scale);
+      const x=Math.round((S-w)/2), y=Math.round((S-h)/2);
+      ctx.drawImage(img,x,y,w,h);
       URL.revokeObjectURL(url);
-      res(c.toDataURL('image/jpeg',0.82));
+      res(c.toDataURL('image/jpeg',0.85));
     };
     img.src=url;
   });
@@ -307,6 +342,7 @@ document.querySelectorAll('nav button').forEach(b=>{
 function renderCurrentView(v){
   if(v==='outfit'){renderOutfitView();}
   if(v==='suitcase'){renderSuitcaseView();}
+  if(v==='settings'){renderSettingsView();}
 }
 
 /* ============ DRESSING ============ */
@@ -536,6 +572,67 @@ async function renderSuitcaseView(){
   });
   $('subtitle').textContent='Prépare tes déplacements';
 }
+
+/* ============ RÉGLAGES : export / import ============ */
+async function renderSettingsView(){
+  const outfits=(await getAll('outfits')).filter(o=>o.itemIds&&o.itemIds.length);
+  const suitcases=await getAll('suitcases');
+  $('settings-stats').innerHTML=`
+    <div class="stat"><div class="n">${items.length}</div><div class="l">Vêtements</div></div>
+    <div class="stat"><div class="n">${outfits.length}</div><div class="l">Tenues</div></div>
+    <div class="stat"><div class="n">${suitcases.length}</div><div class="l">Valises</div></div>`;
+  $('subtitle').textContent='Sauvegarde & restauration';
+}
+
+async function exportData(){
+  const data={
+    app:'dressing',
+    version:1,
+    exportedAt:new Date().toISOString(),
+    items:await getAll('items'),
+    outfits:await getAll('outfits'),
+    suitcases:await getAll('suitcases')
+  };
+  const blob=new Blob([JSON.stringify(data)],{type:'application/json'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');
+  a.href=url;
+  a.download='dressing-sauvegarde-'+todayStr()+'.json';
+  document.body.appendChild(a);a.click();a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),1000);
+  toast('Sauvegarde exportée ✓');
+}
+$('export-btn').onclick=exportData;
+
+$('import-btn').onclick=()=>$('import-input').click();
+$('import-input').onchange=e=>{
+  const f=e.target.files[0];e.target.value='';
+  if(!f)return;
+  const reader=new FileReader();
+  reader.onload=async ev=>{
+    let data;
+    try{data=JSON.parse(ev.target.result);}
+    catch{toast('Fichier illisible ❌');return;}
+    if(data.app!=='dressing'||!Array.isArray(data.items)){
+      toast('Fichier de sauvegarde invalide ❌');return;
+    }
+    const n=data.items.length;
+    if(!confirm(`Importer cette sauvegarde ?\n\n${n} vêtement(s) vont REMPLACER toutes tes données actuelles. Action irréversible.`))return;
+    try{
+      await clearStore('items');
+      await clearStore('outfits');
+      await clearStore('suitcases');
+      for(const it of data.items) await put('items',it);
+      for(const o of (data.outfits||[])) await put('outfits',o);
+      for(const s of (data.suitcases||[])) await put('suitcases',s);
+      items=await getAll('items');
+      activeFilters=new Set();
+      renderCloset();renderSettingsView();
+      toast('Sauvegarde restaurée ✓');
+    }catch(err){toast('Erreur pendant l\'import ❌');}
+  };
+  reader.readAsText(f);
+};
 
 /* Fermer modals en cliquant le fond */
 document.querySelectorAll('.modal').forEach(m=>m.addEventListener('click',e=>{if(e.target===m)m.classList.remove('open');}));
